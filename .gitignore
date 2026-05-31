@@ -2,3 +2,5 @@
 .idea/
 
 prompts.md
+
+.env.sh

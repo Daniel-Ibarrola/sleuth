@@ -1,5 +1,6 @@
 use crate::errors::SleuthError;
-use octocrab::{models, params::workflows::Filter};
+use octocrab::{Octocrab, models, params::workflows::Filter};
+use std::collections::HashMap;
 
 pub struct Step {
     pub name: String,
@@ -22,11 +23,24 @@ pub struct WorkflowRun {
     pub status: String,
     pub conclusion: Option<String>,
     pub jobs: Vec<WorkflowJob>,
+    // TODO: should we store failed logs in this struct?
+    pub failed_jobs_logs: HashMap<u64, String>,
 }
 
-async fn fetch_run(owner: &str, repo: &str, run_id: u64) -> Result<WorkflowRun, octocrab::Error> {
-    let octocrab = octocrab::instance();
+pub fn get_github_client() -> Result<Octocrab, octocrab::Error> {
+    // TODO: add logging
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Octocrab::builder().personal_token(token).build(),
+        _ => Octocrab::builder().build(),
+    }
+}
 
+async fn fetch_run(
+    owner: &str,
+    repo: &str,
+    run_id: u64,
+    octocrab: &Octocrab,
+) -> Result<WorkflowRun, octocrab::Error> {
     let workflows = octocrab.workflows(owner, repo);
     let run = workflows.get(run_id.into()).await?;
     let jobs_page = workflows
@@ -62,11 +76,44 @@ async fn fetch_run(owner: &str, repo: &str, run_id: u64) -> Result<WorkflowRun, 
         status: run.status,
         conclusion: run.conclusion,
         jobs,
+        failed_jobs_logs: HashMap::new(),
     })
 }
 
+pub async fn fetch_job_logs(
+    owner: &str,
+    repo: &str,
+    job_id: u64,
+    requests_client: &reqwest::Client,
+) -> Result<String, SleuthError> {
+    // TODO: this endpoint requires authentication. We should fallback to
+    //  GET repos/OWNER/REPO/actions/runs/RUN_ID/logs if the user is not authenticated.
+    //  This downloads all logs in a zip file
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs");
+    let mut request = requests_client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2026-03-10")
+        .header("User-Agent", "sleuth");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+
+    let response = request.send().await?.error_for_status()?;
+
+    Ok(response.text().await?)
+}
+
 // Get run metadata and logs and print nice report
-pub async fn get_run_data(repo: &str, run_id: u64) -> Result<WorkflowRun, SleuthError> {
+pub async fn get_run_data(
+    repo: &str,
+    run_id: u64,
+    github_client: &Octocrab,
+    requests_client: &reqwest::Client,
+) -> Result<WorkflowRun, SleuthError> {
     let (owner, repo) = repo.split_once('/').ok_or_else(|| {
         SleuthError::InvalidFormat(String::from(
             "Invalid repository format, expected 'owner/repo'",
@@ -79,7 +126,18 @@ pub async fn get_run_data(repo: &str, run_id: u64) -> Result<WorkflowRun, Sleuth
         )));
     }
 
-    let run = fetch_run(owner, repo, run_id).await?;
+    let mut run = fetch_run(owner, repo, run_id, &github_client).await?;
+    let mut logs = HashMap::<u64, String>::new();
+    for job in &run.jobs {
+        if job.conclusion == Some(models::workflows::Conclusion::Failure)
+            || job.conclusion == Some(models::workflows::Conclusion::TimedOut)
+        {
+            let log = fetch_job_logs(owner, repo, job.id, &requests_client).await?;
+            logs.insert(job.id, log);
+        }
+    }
+    run.failed_jobs_logs = logs;
+
     Ok(run)
 }
 
@@ -90,10 +148,7 @@ pub fn print_run(run: WorkflowRun) {
     println!("Run ID:      {}", run.id);
     println!("Name:        {}", run.name);
     println!("Workflow ID: {}", run.workflow_id);
-    println!(
-        "Status:      {}",
-        format!("{}", run.status).to_lowercase()
-    );
+    println!("Status:      {}", format!("{}", run.status).to_lowercase());
     println!(
         "Conclusion:  {}",
         run.conclusion.unwrap_or_else(|| "unknown".to_string())
@@ -140,30 +195,29 @@ pub fn print_run(run: WorkflowRun) {
             );
         }
 
-        println!();
+        println!("Failed jobs logs:");
+        println!("-----------------");
+        println!("{:#?}", run.failed_jobs_logs);
+        println!()
     }
 }
 
-fn format_conclusion(conclusion: Option<&octocrab::models::workflows::Conclusion>) -> String {
+fn format_conclusion(conclusion: Option<&models::workflows::Conclusion>) -> String {
     conclusion
         .map(|conclusion| format!("{conclusion:?}").to_lowercase())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn marker_for_conclusion(
-    conclusion: Option<&octocrab::models::workflows::Conclusion>,
-) -> &'static str {
+fn marker_for_conclusion(conclusion: Option<&models::workflows::Conclusion>) -> &'static str {
     match conclusion {
-        Some(octocrab::models::workflows::Conclusion::Success) => "✅",
-        Some(octocrab::models::workflows::Conclusion::Failure) => "❌",
-        Some(octocrab::models::workflows::Conclusion::Skipped) => "⏭️",
-        Some(octocrab::models::workflows::Conclusion::Cancelled) => "🚫",
-        Some(octocrab::models::workflows::Conclusion::TimedOut) => "⏱️",
-        Some(octocrab::models::workflows::Conclusion::ActionRequired) => "⚠️",
-        Some(octocrab::models::workflows::Conclusion::Neutral) => "➖",
+        Some(models::workflows::Conclusion::Success) => "✅",
+        Some(models::workflows::Conclusion::Failure) => "❌",
+        Some(models::workflows::Conclusion::Skipped) => "⏭️",
+        Some(models::workflows::Conclusion::Cancelled) => "🚫",
+        Some(models::workflows::Conclusion::TimedOut) => "⏱️",
+        Some(models::workflows::Conclusion::ActionRequired) => "⚠️",
+        Some(models::workflows::Conclusion::Neutral) => "➖",
         Some(_) => "➖",
         None => "•",
     }
 }
-
-// ... existing code ...
