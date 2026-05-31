@@ -1,3 +1,6 @@
+mod errors;
+mod github;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -77,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     tracing::debug!(?cli, "parsed CLI");
 
+    let default_repo = "Daniel-Ibarrola/sleuth-fixtures";
+
     match cli.command {
         Command::Analyze {
             target: AnalyzeTarget::Run { run_id, repo, json },
@@ -88,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
             target: FetchTarget::Run { run_id, repo },
         } => {
             tracing::info!(run_id, ?repo, "fetch run");
-            println!("not implemented yet");
+            let repo = repo.unwrap_or_else(|| default_repo.to_owned());
+            github::print_run(github::get_run_data(repo.as_str(), run_id).await?);
         }
         Command::History { repo, limit } => {
             tracing::info!(?repo, limit, "history");
