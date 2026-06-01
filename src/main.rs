@@ -84,7 +84,6 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: load config
     let default_repo = "Daniel-Ibarrola/sleuth-fixtures";
-    // TODO: support github token authentication
     let github_client = github::get_github_client()?;
     let requests_client = reqwest::Client::new();
 
@@ -101,7 +100,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(run_id, ?repo, "fetch run");
             let repo = repo.unwrap_or_else(|| default_repo.to_owned());
             github::print_run(
-                github::get_run_data(repo.as_str(), run_id, &github_client, &requests_client).await?,
+                github::get_run_data(
+                    repo.as_str(),
+                    run_id,
+                    &github_client,
+                    &requests_client,
+                    github::GITHUB_API_BASE,
+                )
+                .await?,
             );
         }
         Command::History { repo, limit } => {
