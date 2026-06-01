@@ -34,10 +34,15 @@ pub struct WorkflowRun {
 }
 
 pub fn get_github_client() -> Result<Octocrab, octocrab::Error> {
-    // TODO: add logging
     match std::env::var("GITHUB_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => Octocrab::builder().personal_token(token).build(),
-        _ => Octocrab::builder().build(),
+        Ok(token) if !token.trim().is_empty() => {
+            tracing::info!("GitHub: authenticated with GITHUB_TOKEN");
+            Octocrab::builder().personal_token(token).build()
+        }
+        _ => {
+            tracing::info!("GitHub: no GITHUB_TOKEN found, using anonymous access");
+            Octocrab::builder().build()
+        }
     }
 }
 
@@ -47,8 +52,12 @@ async fn fetch_run(
     run_id: u64,
     octocrab: &Octocrab,
 ) -> Result<WorkflowRun, octocrab::Error> {
+    tracing::info!(owner, repo, run_id, "fetching workflow run");
     let workflows = octocrab.workflows(owner, repo);
     let run = workflows.get(run_id.into()).await?;
+    tracing::debug!(name = run.name, status = run.status, "run metadata received");
+
+    tracing::info!(run_id, "fetching jobs");
     let jobs_page = workflows
         .list_jobs(run_id.into())
         .per_page(100)
@@ -56,7 +65,7 @@ async fn fetch_run(
         .send()
         .await?;
 
-    let jobs = jobs_page
+    let jobs: Vec<WorkflowJob> = jobs_page
         .into_iter()
         .map(|job| WorkflowJob {
             id: job.id.into_inner(),
@@ -74,6 +83,9 @@ async fn fetch_run(
                 .collect(),
         })
         .collect();
+
+    let job_count = jobs.len();
+    tracing::info!(job_count, "jobs received");
 
     Ok(WorkflowRun {
         id: run.id.into_inner(),
@@ -93,9 +105,12 @@ async fn fetch_job_logs(
     requests_client: &reqwest::Client,
     base_url: &str,
 ) -> Result<String, SleuthError> {
-    // TODO: this endpoint requires authentication. We should fallback to
-    //  GET repos/OWNER/REPO/actions/runs/RUN_ID/logs if the user is not authenticated.
-    //  This downloads all logs in a zip file
+    // TODO: fall back to GET /actions/runs/{run_id}/logs (zip) when unauthenticated
+    let authenticated = std::env::var("GITHUB_TOKEN")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    tracing::info!(job_id, authenticated, "fetching job logs");
+
     let url = format!("{base_url}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs");
     let mut request = requests_client
         .get(url)
@@ -103,14 +118,15 @@ async fn fetch_job_logs(
         .header("X-GitHub-Api-Version", "2026-03-10")
         .header("User-Agent", "sleuth");
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if authenticated {
+        let token = std::env::var("GITHUB_TOKEN").unwrap();
+        request = request.bearer_auth(token);
     }
 
     let response = request.send().await?.error_for_status()?;
-    Ok(response.text().await?)
+    let log = response.text().await?;
+    tracing::debug!(job_id, bytes = log.len(), "job log received");
+    Ok(log)
 }
 
 pub async fn get_run_data(
@@ -134,13 +150,19 @@ pub async fn get_run_data(
 
     let mut run = fetch_run(owner, repo, run_id, github_client).await?;
     let mut logs = HashMap::<u64, String>::new();
-    for job in &run.jobs {
-        if job.conclusion == Some(models::workflows::Conclusion::Failure)
-            || job.conclusion == Some(models::workflows::Conclusion::TimedOut)
-        {
-            let log = fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?;
-            logs.insert(job.id, log);
-        }
+    let failed_jobs: Vec<_> = run
+        .jobs
+        .iter()
+        .filter(|j| {
+            j.conclusion == Some(models::workflows::Conclusion::Failure)
+                || j.conclusion == Some(models::workflows::Conclusion::TimedOut)
+        })
+        .collect();
+
+    tracing::info!(count = failed_jobs.len(), "fetching logs for failed jobs");
+    for job in failed_jobs {
+        let log = fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?;
+        logs.insert(job.id, log);
     }
     run.failed_jobs_logs = logs;
 
