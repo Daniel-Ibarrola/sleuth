@@ -1,6 +1,5 @@
 use crate::errors::SleuthError;
 use octocrab::{Octocrab, models, params::workflows::Filter};
-use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 
 pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -19,6 +18,7 @@ pub struct WorkflowJob {
     pub conclusion: Option<models::workflows::Conclusion>,
     pub name: String,
     pub steps: Vec<Step>,
+    pub log: Option<String>,
 }
 
 #[derive(Debug)]
@@ -29,8 +29,6 @@ pub struct WorkflowRun {
     pub status: String,
     pub conclusion: Option<String>,
     pub jobs: Vec<WorkflowJob>,
-    // TODO: should we store failed logs in this struct?
-    pub failed_jobs_logs: HashMap<u64, String>,
 }
 
 pub fn get_github_client() -> Result<Octocrab, octocrab::Error> {
@@ -81,6 +79,7 @@ async fn fetch_run(
                     conclusion: step.conclusion,
                 })
                 .collect(),
+            log: None,
         })
         .collect();
 
@@ -94,7 +93,6 @@ async fn fetch_run(
         status: run.status,
         conclusion: run.conclusion,
         jobs,
-        failed_jobs_logs: HashMap::new(),
     })
 }
 
@@ -149,22 +147,26 @@ pub async fn get_run_data(
     }
 
     let mut run = fetch_run(owner, repo, run_id, github_client).await?;
-    let mut logs = HashMap::<u64, String>::new();
-    let failed_jobs: Vec<_> = run
+
+    let failed_count = run
         .jobs
         .iter()
         .filter(|j| {
             j.conclusion == Some(models::workflows::Conclusion::Failure)
                 || j.conclusion == Some(models::workflows::Conclusion::TimedOut)
         })
-        .collect();
+        .count();
+    tracing::info!(count = failed_count, "fetching logs for failed jobs");
 
-    tracing::info!(count = failed_jobs.len(), "fetching logs for failed jobs");
-    for job in failed_jobs {
-        let log = fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?;
-        logs.insert(job.id, log);
+    for job in run.jobs.iter_mut() {
+        if job.conclusion == Some(models::workflows::Conclusion::Failure)
+            || job.conclusion == Some(models::workflows::Conclusion::TimedOut)
+        {
+            job.log = Some(
+                fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?,
+            );
+        }
     }
-    run.failed_jobs_logs = logs;
 
     Ok(run)
 }
@@ -211,30 +213,28 @@ pub fn format_run(run: &WorkflowRun) -> String {
 
         if job.steps.is_empty() {
             writeln!(out, "  Steps: none found").unwrap();
-            writeln!(out).unwrap();
-            continue;
+        } else {
+            writeln!(out, "  Steps:").unwrap();
+            for step in &job.steps {
+                let marker = marker_for_conclusion(step.conclusion.as_ref());
+                writeln!(
+                    out,
+                    "    {} {}  [{} / {}]",
+                    marker,
+                    step.name,
+                    format!("{:?}", step.status).to_lowercase(),
+                    format_conclusion(step.conclusion.as_ref()),
+                )
+                .unwrap();
+            }
         }
 
-        writeln!(out, "  Steps:").unwrap();
-
-        for step in &job.steps {
-            let marker = marker_for_conclusion(step.conclusion.as_ref());
-
-            writeln!(
-                out,
-                "    {} {}  [{} / {}]",
-                marker,
-                step.name,
-                format!("{:?}", step.status).to_lowercase(),
-                format_conclusion(step.conclusion.as_ref()),
-            )
-            .unwrap();
+        if let Some(log) = &job.log {
+            writeln!(out, "  Log:").unwrap();
+            writeln!(out, "  ----").unwrap();
+            writeln!(out, "{log}").unwrap();
         }
 
-        writeln!(out, "Failed jobs logs:").unwrap();
-        writeln!(out, "-----------------").unwrap();
-        // TODO: format logs and don't print map
-        writeln!(out, "{:#?}", run.failed_jobs_logs).unwrap();
         writeln!(out).unwrap();
     }
 
@@ -402,7 +402,6 @@ mod tests {
             status: "completed".to_string(),
             conclusion: Some("success".to_string()),
             jobs: vec![],
-            failed_jobs_logs: HashMap::new(),
         }
     }
 
@@ -420,6 +419,7 @@ mod tests {
                     status: models::workflows::Status::Completed,
                     conclusion: Some(models::workflows::Conclusion::Success),
                     steps: vec![],
+                    log: None,
                 },
                 WorkflowJob {
                     id: 200,
@@ -431,9 +431,9 @@ mod tests {
                         status: models::workflows::Status::Completed,
                         conclusion: Some(models::workflows::Conclusion::Failure),
                     }],
+                    log: Some("error: assertion failed\n".to_string()),
                 },
             ],
-            failed_jobs_logs: HashMap::from([(200, "error: assertion failed\n".to_string())]),
         }
     }
 
@@ -458,7 +458,6 @@ mod tests {
             status: "in_progress".to_string(),
             conclusion: None,
             jobs: vec![],
-            failed_jobs_logs: HashMap::new(),
         };
         assert!(format_run(&run).contains("Conclusion:  unknown"));
     }
@@ -544,7 +543,7 @@ mod tests {
         assert_eq!(run.name, "CI");
         assert_eq!(run.jobs.len(), 1);
         assert_eq!(run.jobs[0].name, "build");
-        assert!(run.failed_jobs_logs.is_empty());
+        assert!(run.jobs[0].log.is_none());
     }
 
     #[tokio::test]
@@ -572,7 +571,7 @@ mod tests {
 
         assert_eq!(run.jobs.len(), 1);
         assert_eq!(
-            run.failed_jobs_logs.get(&99).unwrap(),
+            run.jobs[0].log.as_deref().unwrap(),
             "Error: assertion failed at line 42"
         );
     }
@@ -605,6 +604,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(run.failed_jobs_logs.contains_key(&55));
+        assert!(run.jobs[0].log.is_some());
     }
 }
