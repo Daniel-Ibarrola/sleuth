@@ -82,10 +82,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     tracing::debug!(?cli, "parsed CLI");
 
-    // TODO: load config
+    // TODO: config is hardcoded for now.
     let default_repo = "Daniel-Ibarrola/sleuth-fixtures";
-    let github_client = github::get_github_client()?;
-    let requests_client = reqwest::Client::new();
 
     match cli.command {
         Command::Analyze {
@@ -99,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!(run_id, ?repo, "fetch run");
             let repo = repo.unwrap_or_else(|| default_repo.to_owned());
+            let github_client = github::get_github_client()?;
+            let requests_client = reqwest::Client::new();
             github::print_run(
                 github::get_run_data(
                     repo.as_str(),

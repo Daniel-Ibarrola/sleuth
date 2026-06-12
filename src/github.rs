@@ -1,26 +1,98 @@
+//! GitHub Actions data access.
+//!
+//! Provides two public entry points:
+//! - [`get_github_client`] — builds an authenticated octocrab client from `GITHUB_TOKEN`.
+//! - [`get_run_data`] — fetches workflow run metadata, jobs, and logs for failing jobs.
+//!
+//! The per-job log endpoint (`/actions/jobs/{job_id}/logs`) requires authentication even for
+//! public repositories, so `GITHUB_TOKEN` is mandatory. Both functions return an error if the
+//! variable is absent or empty.
+
 use crate::errors::SleuthError;
 use octocrab::{Octocrab, models, params::workflows::Filter};
 use std::fmt::Write as FmtWrite;
 
 pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
+/// Execution status of a job or step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobStatus {
+    Pending,
+    Queued,
+    InProgress,
+    Completed,
+    Failed,
+    Waiting,
+    /// Catch-all for variants added to the GitHub API after this was written.
+    Unknown(String),
+}
+
+impl From<models::workflows::Status> for JobStatus {
+    fn from(s: models::workflows::Status) -> Self {
+        match s {
+            models::workflows::Status::Pending => Self::Pending,
+            models::workflows::Status::Queued => Self::Queued,
+            models::workflows::Status::InProgress => Self::InProgress,
+            models::workflows::Status::Completed => Self::Completed,
+            models::workflows::Status::Failed => Self::Failed,
+            models::workflows::Status::Waiting => Self::Waiting,
+            _ => Self::Unknown(format!("{s:?}")),
+        }
+    }
+}
+
+/// Final outcome of a job or step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobConclusion {
+    ActionRequired,
+    Cancelled,
+    Failure,
+    Neutral,
+    Skipped,
+    Success,
+    TimedOut,
+    /// Catch-all for variants added to the GitHub API after this was written.
+    Unknown(String),
+}
+
+impl From<models::workflows::Conclusion> for JobConclusion {
+    fn from(c: models::workflows::Conclusion) -> Self {
+        match c {
+            models::workflows::Conclusion::ActionRequired => Self::ActionRequired,
+            models::workflows::Conclusion::Cancelled => Self::Cancelled,
+            models::workflows::Conclusion::Failure => Self::Failure,
+            models::workflows::Conclusion::Neutral => Self::Neutral,
+            models::workflows::Conclusion::Skipped => Self::Skipped,
+            models::workflows::Conclusion::Success => Self::Success,
+            models::workflows::Conclusion::TimedOut => Self::TimedOut,
+            _ => Self::Unknown(format!("{c:?}")),
+        }
+    }
+}
+
+/// One step within a job (e.g. "Set up job", "Run tests").
 #[derive(Debug)]
 pub struct Step {
     pub name: String,
-    pub status: models::workflows::Status,
-    pub conclusion: Option<models::workflows::Conclusion>,
+    pub status: JobStatus,
+    pub conclusion: Option<JobConclusion>,
 }
 
+/// A single job within a workflow run.
+///
+/// `log` is `Some` only for jobs whose conclusion is `Failure` or `TimedOut`; it is populated
+/// by [`get_run_data`] after the job list is fetched.
 #[derive(Debug)]
 pub struct WorkflowJob {
     pub id: u64,
-    pub status: models::workflows::Status,
-    pub conclusion: Option<models::workflows::Conclusion>,
+    pub status: JobStatus,
+    pub conclusion: Option<JobConclusion>,
     pub name: String,
     pub steps: Vec<Step>,
     pub log: Option<String>,
 }
 
+/// Top-level result of a workflow run, including all jobs and their logs.
 #[derive(Debug)]
 pub struct WorkflowRun {
     pub id: u64,
@@ -31,19 +103,23 @@ pub struct WorkflowRun {
     pub jobs: Vec<WorkflowJob>,
 }
 
-pub fn get_github_client() -> Result<Octocrab, octocrab::Error> {
+/// Builds an octocrab client authenticated with `GITHUB_TOKEN`.
+///
+/// Returns [`SleuthError::MissingGithubToken`] if the variable is absent or blank.
+pub fn get_github_client() -> Result<Octocrab, SleuthError> {
     match std::env::var("GITHUB_TOKEN") {
         Ok(token) if !token.trim().is_empty() => {
             tracing::info!("GitHub: authenticated with GITHUB_TOKEN");
-            Octocrab::builder().personal_token(token).build()
+            Octocrab::builder()
+                .personal_token(token)
+                .build()
+                .map_err(SleuthError::GithubError)
         }
-        _ => {
-            tracing::info!("GitHub: no GITHUB_TOKEN found, using anonymous access");
-            Octocrab::builder().build()
-        }
+        _ => Err(SleuthError::MissingGithubToken),
     }
 }
 
+/// Fetches run metadata and the job list via octocrab. Logs are not fetched here.
 async fn fetch_run(
     owner: &str,
     repo: &str,
@@ -53,7 +129,11 @@ async fn fetch_run(
     tracing::info!(owner, repo, run_id, "fetching workflow run");
     let workflows = octocrab.workflows(owner, repo);
     let run = workflows.get(run_id.into()).await?;
-    tracing::debug!(name = run.name, status = run.status, "run metadata received");
+    tracing::debug!(
+        name = run.name,
+        status = run.status,
+        "run metadata received"
+    );
 
     tracing::info!(run_id, "fetching jobs");
     let jobs_page = workflows
@@ -67,16 +147,16 @@ async fn fetch_run(
         .into_iter()
         .map(|job| WorkflowJob {
             id: job.id.into_inner(),
-            status: job.status,
-            conclusion: job.conclusion,
+            status: job.status.into(),
+            conclusion: job.conclusion.map(Into::into),
             name: job.name,
             steps: job
                 .steps
                 .into_iter()
                 .map(|step| Step {
                     name: step.name,
-                    status: step.status,
-                    conclusion: step.conclusion,
+                    status: step.status.into(),
+                    conclusion: step.conclusion.map(Into::into),
                 })
                 .collect(),
             log: None,
@@ -96,6 +176,10 @@ async fn fetch_run(
     })
 }
 
+/// Downloads the raw log text for a single job via the REST API.
+///
+/// Uses `GITHUB_TOKEN` for auth. The log endpoint returns a redirect on success; reqwest follows
+/// it automatically. Returns [`SleuthError::MissingGithubToken`] if the token is absent.
 async fn fetch_job_logs(
     owner: &str,
     repo: &str,
@@ -103,11 +187,7 @@ async fn fetch_job_logs(
     requests_client: &reqwest::Client,
     base_url: &str,
 ) -> Result<String, SleuthError> {
-    // TODO: fall back to GET /actions/runs/{run_id}/logs (zip) when unauthenticated
-    let authenticated = std::env::var("GITHUB_TOKEN")
-        .map(|t| !t.trim().is_empty())
-        .unwrap_or(false);
-    tracing::info!(job_id, authenticated, "fetching job logs");
+    tracing::info!(job_id, "fetching job logs");
 
     let url = format!("{base_url}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs");
     let mut request = requests_client
@@ -116,10 +196,9 @@ async fn fetch_job_logs(
         .header("X-GitHub-Api-Version", "2026-03-10")
         .header("User-Agent", "sleuth");
 
-    if authenticated {
-        let token = std::env::var("GITHUB_TOKEN").unwrap();
-        request = request.bearer_auth(token);
-    }
+
+    let token = std::env::var("GITHUB_TOKEN").map_err(|_| SleuthError::MissingGithubToken)?;
+    request = request.bearer_auth(token);
 
     let response = request.send().await?.error_for_status()?;
     let log = response.text().await?;
@@ -127,6 +206,10 @@ async fn fetch_job_logs(
     Ok(log)
 }
 
+/// Fetches a complete [`WorkflowRun`]: metadata, all jobs, and logs for any failing jobs.
+///
+/// `repo` must be in `owner/name` form. Returns [`SleuthError::InvalidFormat`] immediately if
+/// it is not. Log fetching requires `GITHUB_TOKEN` (see [`fetch_job_logs`]).
 pub async fn get_run_data(
     repo: &str,
     run_id: u64,
@@ -152,25 +235,25 @@ pub async fn get_run_data(
         .jobs
         .iter()
         .filter(|j| {
-            j.conclusion == Some(models::workflows::Conclusion::Failure)
-                || j.conclusion == Some(models::workflows::Conclusion::TimedOut)
+            j.conclusion == Some(JobConclusion::Failure)
+                || j.conclusion == Some(JobConclusion::TimedOut)
         })
         .count();
     tracing::info!(count = failed_count, "fetching logs for failed jobs");
 
     for job in run.jobs.iter_mut() {
-        if job.conclusion == Some(models::workflows::Conclusion::Failure)
-            || job.conclusion == Some(models::workflows::Conclusion::TimedOut)
+        if job.conclusion == Some(JobConclusion::Failure)
+            || job.conclusion == Some(JobConclusion::TimedOut)
         {
-            job.log = Some(
-                fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?,
-            );
+            job.log =
+                Some(fetch_job_logs(owner, repo, job.id, requests_client, github_api_base).await?);
         }
     }
 
     Ok(run)
 }
 
+/// Renders a [`WorkflowRun`] as a human-readable string for terminal output.
 pub fn format_run(run: &WorkflowRun) -> String {
     let mut out = String::new();
 
@@ -205,7 +288,7 @@ pub fn format_run(run: &WorkflowRun) -> String {
             "{} {}  [{} / {}]",
             marker,
             job.name,
-            format!("{:?}", job.status).to_lowercase(),
+            format_status(&job.status),
             format_conclusion(job.conclusion.as_ref()),
         )
         .unwrap();
@@ -241,26 +324,45 @@ pub fn format_run(run: &WorkflowRun) -> String {
     out
 }
 
+/// Prints a [`WorkflowRun`] to stdout via [`format_run`].
 pub fn print_run(run: WorkflowRun) {
     print!("{}", format_run(&run));
 }
 
-fn format_conclusion(conclusion: Option<&models::workflows::Conclusion>) -> String {
-    conclusion
-        .map(|conclusion| format!("{conclusion:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string())
+fn format_status(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Pending => "pending",
+        JobStatus::Queued => "queued",
+        JobStatus::InProgress => "in_progress",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
+        JobStatus::Waiting => "waiting",
+        JobStatus::Unknown(_) => "unknown",
+    }
 }
 
-fn marker_for_conclusion(conclusion: Option<&models::workflows::Conclusion>) -> &'static str {
+fn format_conclusion(conclusion: Option<&JobConclusion>) -> &'static str {
     match conclusion {
-        Some(models::workflows::Conclusion::Success) => "✅",
-        Some(models::workflows::Conclusion::Failure) => "❌",
-        Some(models::workflows::Conclusion::Skipped) => "⏭️",
-        Some(models::workflows::Conclusion::Cancelled) => "🚫",
-        Some(models::workflows::Conclusion::TimedOut) => "⏱️",
-        Some(models::workflows::Conclusion::ActionRequired) => "⚠️",
-        Some(models::workflows::Conclusion::Neutral) => "➖",
-        Some(_) => "➖",
+        Some(JobConclusion::ActionRequired) => "action_required",
+        Some(JobConclusion::Cancelled) => "cancelled",
+        Some(JobConclusion::Failure) => "failure",
+        Some(JobConclusion::Neutral) => "neutral",
+        Some(JobConclusion::Skipped) => "skipped",
+        Some(JobConclusion::Success) => "success",
+        Some(JobConclusion::TimedOut) => "timed_out",
+        Some(JobConclusion::Unknown(_)) | None => "unknown",
+    }
+}
+
+fn marker_for_conclusion(conclusion: Option<&JobConclusion>) -> &'static str {
+    match conclusion {
+        Some(JobConclusion::Success) => "✅",
+        Some(JobConclusion::Failure) => "❌",
+        Some(JobConclusion::Skipped) => "⏭️",
+        Some(JobConclusion::Cancelled) => "🚫",
+        Some(JobConclusion::TimedOut) => "⏱️",
+        Some(JobConclusion::ActionRequired) => "⚠️",
+        Some(JobConclusion::Neutral) | Some(JobConclusion::Unknown(_)) => "➖",
         None => "•",
     }
 }
@@ -416,20 +518,20 @@ mod tests {
                 WorkflowJob {
                     id: 100,
                     name: "build".to_string(),
-                    status: models::workflows::Status::Completed,
-                    conclusion: Some(models::workflows::Conclusion::Success),
+                    status: JobStatus::Completed,
+                    conclusion: Some(JobConclusion::Success),
                     steps: vec![],
                     log: None,
                 },
                 WorkflowJob {
                     id: 200,
                     name: "test".to_string(),
-                    status: models::workflows::Status::Completed,
-                    conclusion: Some(models::workflows::Conclusion::Failure),
+                    status: JobStatus::Completed,
+                    conclusion: Some(JobConclusion::Failure),
                     steps: vec![Step {
                         name: "Run tests".to_string(),
-                        status: models::workflows::Status::Completed,
-                        conclusion: Some(models::workflows::Conclusion::Failure),
+                        status: JobStatus::Completed,
+                        conclusion: Some(JobConclusion::Failure),
                     }],
                     log: Some("error: assertion failed\n".to_string()),
                 },
@@ -548,6 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_run_data_fetches_logs_for_failed_jobs() {
+        unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
         let server = MockServer::start().await;
 
         mock_run(&server, 456, Some("failure")).await;
@@ -578,6 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_run_data_fetches_logs_for_timed_out_jobs() {
+        unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
         let server = MockServer::start().await;
 
         mock_run(&server, 789, Some("timed_out")).await;

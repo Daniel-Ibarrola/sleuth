@@ -22,8 +22,8 @@ In scope:
 
 1. Add GitHub API support using `octocrab`.
 2. Use `reqwest` where needed for log download behavior.
-3. Authenticate anonymously by default.
-4. Use `GITHUB_TOKEN` when present.
+3. Require `GITHUB_TOKEN` and fail early with a clear error if it is absent.
+4. Use `GITHUB_TOKEN` for all GitHub API calls.
 5. Implement a GitHub-facing function to fetch workflow run metadata, jobs, and failing jobs.
 6. Implement a GitHub-facing function to fetch raw job logs.
 7. Implement `sleuth fetch run <RUN_ID> --repo owner/name`.
@@ -73,10 +73,10 @@ If the run or repository cannot be fetched, the command should fail with a clear
 
 ## Authentication decisions
 
-1. Public repositories should work without credentials.
-2. If `GITHUB_TOKEN` is set, it should be used automatically.
-3. Missing `GITHUB_TOKEN` is not an error for public repositories.
-4. Authentication and authorization failures should produce actionable errors.
+1. `GITHUB_TOKEN` is required. The GitHub per-job log endpoint requires authentication even for public repositories — anonymous access is rejected with a 403.
+2. If `GITHUB_TOKEN` is not set, the tool must fail immediately before attempting any network call, with a clear error message explaining that a token with at least `repo` read access is needed.
+3. If `GITHUB_TOKEN` is set, it should be used automatically for all GitHub calls.
+4. Authentication and authorization failures (bad token, insufficient scope, private repo) should produce actionable error messages.
 
 ## Testing decisions
 

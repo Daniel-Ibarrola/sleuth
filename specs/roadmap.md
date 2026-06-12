@@ -17,12 +17,13 @@ Exit criteria: `cargo run -- analyze run 1` prints "not implemented yet" and exi
 
 ## Phase 1 — Fetch a GitHub Actions run
 
-**Status:** todo
+**Status:** in progress
 
 - Add `octocrab` and `reqwest`.
 - Implement `github::fetch_run(repo, run_id)` returning workflow run metadata, the list of jobs, and the failing job(s).
 - Implement `github::fetch_job_logs(repo, job_id)` returning the raw log text.
-- Anonymous for public repos; pick up `GITHUB_TOKEN` if present.
+- **`GITHUB_TOKEN` is required.** The GitHub per-job log endpoint requires authentication even for public repositories. The tool must fail early with a clear error if `GITHUB_TOKEN` is not set, before attempting any log fetch.
+- Run metadata and job lists are fetched using token-based auth via octocrab.
 - `sleuth fetch run <ID> --repo owner/name` dumps a summary of jobs and the failing log to stdout.
 
 Exit criteria: against a real public failing run, the tool prints job names, statuses, and the failing log.
